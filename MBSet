@@ -1,0 +1,390 @@
+/* 
+ * File:   MBSet.cu
+ * 
+ * Created on June 24, 2012
+ * 
+ * Purpose:  This program displays Mandelbrot set using the GPU via CUDA and
+ * OpenGL immediate mode.
+ * 
+ */
+
+#include <iostream>
+#include <stack>
+#include <cuda_runtime_api.h>
+#include <stdio.h>
+#include "Complex.cu"
+#include <algorithm>
+#include <GL/freeglut.h>
+
+// Size of window in pixels, both width and height
+#define WINDOW_DIM            512
+
+using namespace std;
+// Keyboard, Mouse and Motion function declaration
+void my_keyboard (unsigned char key, int x, int y);                                                 // Function for keystroke processing 
+void my_mouse(int button, int state, int x, int y);                                                 // Function for mouse selection
+void my_motion(int x, int y);                                                                      // Vector of class Memory, used to store minC, maxC
+
+// Define the RGB Class
+class RGB
+{
+  public:
+    RGB()
+      : r(0), g(0), b(0) {}
+    RGB(double r0, double g0, double b0)
+      : r(r0), g(g0), b(b0) {}
+  public:
+    double r;
+    double g;
+    double b;
+};
+
+RGB* colors = 0; // Array of color values
+stack<int> mystack;
+
+// Initial screen coordinates, both host and device.
+Complex minC(-2.0, -1.2);
+Complex maxC(1.0, 1.8);
+Complex* dev_minC;
+Complex* dev_maxC;
+Complex* dev_c;
+const int maxIt = 2000; // Maximum Iterations
+Complex* h_cArray; //Array on host
+int* h_pixelColours;
+int* d_pixelColours;
+Complex* d_cArray; // Array on device
+int x1, x2, yone, y2;
+bool leftButton; // related to mouse click
+int startX, startY;
+int endX, endY;
+stack<double> cStack; //for going back to previous state      
+
+void InitializeColors()
+{
+  colors = new RGB[maxIt + 1];
+  for (int i = 0; i < maxIt; ++i)
+    {
+      if (i < 5)
+        { // Try this.. just white for small 'it' counts
+          colors[i] = RGB(1, 1, 1);
+        }
+      else
+        {
+          colors[i] = RGB(drand48(), drand48(), drand48());
+        }
+    }
+  colors[maxIt] = RGB(); // black
+}
+
+void drawPixel()
+{
+  for (int y = 0; y < WINDOW_DIM; ++y)
+  {
+    for (int x = 0; x < WINDOW_DIM; ++x)
+    {
+      glBegin(GL_POINTS);
+        glColor3f(colors[h_pixelColours[y * WINDOW_DIM + x]].r, colors[h_pixelColours[y*WINDOW_DIM+x]].g, colors[h_pixelColours[y * WINDOW_DIM + x]].b);
+        glVertex2f(x,y);
+      glEnd();
+    }
+  }
+}
+
+
+// It's for the mouse when you drag it.. it should show square boundaries
+void drawSquare() 
+{
+  glColor3f(1.0,0.0,0.0); // for red color square
+  glBegin(GL_LINE_LOOP);
+    glVertex2f(startX, startY);
+    glVertex2f(endX, startY);
+    glVertex2f(endX, endY);
+    glVertex2f(startX, endY);
+  glEnd();
+  glFlush();
+  glutPostRedisplay();
+  glutSwapBuffers();
+}
+
+void resize(int w, int h)
+{
+  glViewport(0, 0, w, h);
+  glOrtho(0, w, 0, h, -1, 1);
+ 
+}
+
+__global__ void calculateIterations(int* d_pixelColours, Complex* dev_minC, Complex* dev_maxC)
+{
+  size_t index=blockIdx.x*blockDim.x + threadIdx.x;
+  int x= index%WINDOW_DIM;
+  int y= index/WINDOW_DIM;
+
+  Complex dc(0, 0);
+  dc.r = dev_maxC->r - dev_minC->r;
+  dc.i = dev_maxC->i - dev_minC->i;
+
+  float fx=(float)x/WINDOW_DIM;
+  float fy=(float)y/WINDOW_DIM;
+
+  Complex c(0,0);
+  c.r=dev_minC->r + (fx*dc.r);
+  c.i=dev_minC->i + (fy*dc.i);
+
+  Complex z = c;
+
+  int it=0;
+  while(it<maxIt && z.magnitude2() < 2*2)
+  {
+    z=z*z + c;
+    it++;
+  }
+  d_pixelColours[index] = it;
+}
+
+void callKern()
+{
+  cudaMemcpy(dev_minC, &minC, sizeof(Complex), cudaMemcpyHostToDevice);
+  cudaMemcpy(dev_maxC, &maxC, sizeof(Complex), cudaMemcpyHostToDevice);
+  // call to GPU
+  calculateIterations <<< (WINDOW_DIM * WINDOW_DIM/32), 32 >>>(d_pixelColours, dev_minC, dev_maxC);
+
+  cudaMemcpy(h_pixelColours, d_pixelColours, WINDOW_DIM*WINDOW_DIM*sizeof(int), cudaMemcpyDeviceToHost);
+}
+
+
+void my_display(void)
+{
+  glClear(GL_COLOR_BUFFER_BIT);
+  drawPixel();
+
+  if (!leftButton)
+  {
+    drawSquare();
+  }
+  glutPostRedisplay();
+  glutSwapBuffers();
+}
+
+void init()
+{
+  //select clearing (background) color
+  glClearColor(0.0, 0.0, 0.0, 0.0);
+  glViewport(0, WINDOW_DIM, WINDOW_DIM, 0); 
+  // glShadeModel(GL_FLAT); // not sure 'on' it later
+  glMatrixMode(GL_PROJECTION);
+  glLoadIdentity();
+  gluOrtho2D(0, WINDOW_DIM, 0, WINDOW_DIM);
+  glMatrixMode(GL_MODELVIEW);
+  glLoadIdentity();
+}
+
+
+void timer(int)
+{
+  glutPostRedisplay();
+  glutTimerFunc(50.0, timer, 0);
+}
+
+void compC()
+{
+  for (int y = 0; y < WINDOW_DIM; ++y)
+  {
+    for (int x = 0; x < WINDOW_DIM; ++x)
+    {
+      Complex dc(0, 0);
+      dc.r = maxC.r - minC.r; // range in x-axis
+      dc.i = maxC.i - minC.i; // reange in y-axis
+      float fx = (float)x/WINDOW_DIM; // normalized the 'x' in x-axis
+      float fy = (float)y/WINDOW_DIM; // normalized the 'y' in y-axis
+
+      // put it as a new point for corrdinate (x,y)
+      Complex c = minC + Complex(fx * dc.r, fy * dc.i);
+    
+      // put this in a host Array of type complex
+      h_cArray[y*WINDOW_DIM + x].r = c.r;
+      h_cArray[y*WINDOW_DIM + x].i = c.i;
+    }
+  }
+}
+
+int main(int argc, char** argv)
+{
+  glutInit(&argc, argv);  
+
+  h_pixelColours = (int*)malloc(WINDOW_DIM*WINDOW_DIM*sizeof(int));
+  h_cArray = (Complex*)malloc(WINDOW_DIM*WINDOW_DIM*sizeof(Complex));
+
+  cudaMalloc((void **)&d_pixelColours, WINDOW_DIM*WINDOW_DIM*sizeof(int));
+  cudaMalloc((void **)&d_cArray, WINDOW_DIM*WINDOW_DIM*sizeof(Complex));
+
+  cudaMalloc((void **)&dev_maxC, sizeof(Complex));
+  cudaMalloc((void **)&dev_minC, sizeof(Complex));
+
+  // Do not change this order!
+  // Initialize GL
+  init();
+
+  glutInitDisplayMode(GLUT_RGB | GLUT_SINGLE);
+  glutInitWindowPosition(250, 250);
+  glutInitWindowSize(WINDOW_DIM, WINDOW_DIM);
+  glutCreateWindow("MandelbrotSet");
+
+  InitializeColors();
+  
+  compC();
+  callKern();
+  // set callbacks (aka Register functions here)
+  glutDisplayFunc(my_display);
+  glutIdleFunc(my_display);
+  glutReshapeFunc(resize);
+  // Keyboard
+  glutKeyboardFunc(my_keyboard);
+  // Mouse
+  glutMouseFunc(my_mouse);
+  // Motion
+  glutMotionFunc(my_motion);
+
+  glutTimerFunc(100.0, timer, 0);
+
+  glutMainLoop(); // THis will callback the display, keyboard and mouse
+  return 0;
+  
+}
+
+//////////////////////////////////////////////////////////
+// my_keyboard()
+//////////////////////////////////////////////////////////
+void my_keyboard(unsigned char key, int x, int y)
+{
+  // Keystroke processing here
+  if(key == 'b')
+  {
+    if(!cStack.empty() && !mystack.empty())
+    {
+      maxC.i = cStack.top();
+      cStack.pop();
+      maxC.r = cStack.top();
+      cStack.pop();
+      minC.i = cStack.top();
+      cStack.pop();
+      minC.r = cStack.top();
+      cStack.pop();
+  
+      for(long int i=WINDOW_DIM*WINDOW_DIM; i>0; --i)
+      {
+        h_pixelColours[i] = mystack.top();
+        mystack.pop();
+      }
+  
+      compC();
+      callKern();
+      glutPostRedisplay();
+    }
+  }
+
+  if(key=='q')
+  {
+    exit(0);
+  }
+}
+//////////////////////////////////////////////////////////
+// my_mouse()
+//////////////////////////////////////////////////////////
+void my_mouse(int button, int state, int x, int y)
+{
+  leftButton=0;
+  if((state == GLUT_DOWN) && (button == GLUT_LEFT_BUTTON))
+  {
+    x1 = x;
+    yone = WINDOW_DIM-y;
+    startX = x;
+    startY = WINDOW_DIM-y;
+    leftButton = 0;
+    cStack.push(minC.r);
+    cStack.push(minC.i);
+    cStack.push(maxC.r);
+    cStack.push(maxC.i);
+
+    for(long int i=0; i<WINDOW_DIM*WINDOW_DIM; i++)
+      mystack.push(h_pixelColours[i]);
+
+    endX = x;
+    endY = WINDOW_DIM-y;
+  }
+
+  if((state == GLUT_UP) && (button == GLUT_LEFT_BUTTON))
+  {
+    leftButton = 1;
+  }
+
+  if(leftButton==1)
+  {
+    int minX = min(startX, endX);
+    int maxX = max(startX, endX);
+    int minY = min(startY, endY);
+    int maxY = max(startY, endY);
+
+    minC.r = h_cArray[minY*WINDOW_DIM + minX].r;
+    minC.i = h_cArray[minY*WINDOW_DIM + minX].i;
+    maxC.r = h_cArray[maxY*WINDOW_DIM + maxX].r;
+    maxC.i = h_cArray[maxY*WINDOW_DIM + maxX].i;
+
+    compC();
+    callKern();
+
+    startX = 0;
+    startY = 0;
+    endX = 0;
+    endY = 0;
+
+    glutPostRedisplay();
+  }
+}
+
+////////////////////////////////////////////////////////
+// my_motion
+////////////////////////////////////////////////////////
+void my_motion(int x, int y)
+{
+
+  endX = x;
+  endY = 512-y;
+
+  int dx = endX - startX;
+  int dy = endY - startY;
+
+  if(dx>0 && dy>0)
+  {
+    if(dx<dy)
+      endY = startY+dx;
+    else
+      endX = startX+dy;
+  }
+
+  if(dx<0 && dy>0)
+  {
+    if((-1*dx)<dy)
+      endY = startY+(-1*dx);
+    else
+      endX = startX+(-1*dy);
+  }
+
+  if(dx>0 && dy<0)
+  {
+    if(dx<(-1*dy))
+      endY = startY+(-1*dx);
+    else
+      endX = startX+(-1*dy);
+  }
+
+  if(dx<0 && dy<0)
+  {
+    if(dx>dy)
+      endY = startY+dx;
+    else
+      endX = startX+dy;
+  }
+
+  drawSquare();
+  glutSwapBuffers();
+}
